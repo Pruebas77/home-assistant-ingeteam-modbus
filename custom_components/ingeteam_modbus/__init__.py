@@ -1,4 +1,3 @@
-"""The Ingeteam Modbus Integration."""
 import asyncio
 import logging
 import threading
@@ -36,10 +35,12 @@ from .const import (
     BATTERY_BMS_ALARMS,
     BATTERY_LIMITATION_REASONS,
     AP_REDUCTION_REASONS,
+    BATTERY_BMS_FLAGS,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+# ... (El código de configuración, async_setup, etc. se mantiene igual) ...
 INGETEAM_MODBUS_SCHEMA = vol.Schema(
     {
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
@@ -51,20 +52,14 @@ INGETEAM_MODBUS_SCHEMA = vol.Schema(
         vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): cv.positive_int,
     }
 )
-
 CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({cv.slug: INGETEAM_MODBUS_SCHEMA})}, extra=vol.ALLOW_EXTRA)
-
 PLATFORMS = ["sensor"]
 
-
 async def async_setup(hass, config):
-    """Set up the Ingeteam modbus component."""
     hass.data[DOMAIN] = {}
     return True
 
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Set up a ingeteam mobus."""
     host = entry.data[CONF_HOST]
     name = entry.data[CONF_NAME]
     port = entry.data[CONF_PORT]
@@ -72,39 +67,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     scan_interval = entry.data[CONF_SCAN_INTERVAL]
     read_meter = entry.data.get(CONF_READ_METER, False)
     read_battery = entry.data.get(CONF_READ_BATTERY, False)
-
     _LOGGER.debug("Setup %s.%s", DOMAIN, name)
-
     hub = IngeteamModbusHub(
-        hass,
-        name,
-        host,
-        port,
-        address,
-        scan_interval,
-        read_meter,
-        read_battery,
+        hass, name, host, port, address, scan_interval, read_meter, read_battery
     )
-
-    """Register the hub."""
     hass.data[DOMAIN][name] = {"hub": hub}
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
-
 async def async_unload_entry(hass, entry):
-    """Unload Ingeteam mobus entry."""
     hub: "IngeteamModbusHub" = hass.data[DOMAIN][entry.data["name"]]["hub"]
     hub.close()
-
     unload_ok = all(
         await asyncio.gather(
             *[hass.config_entries.async_forward_entry_unload(entry, component) for component in PLATFORMS]
         )
     )
-    if not unload_ok:
-        return False
-
+    if not unload_ok: return False
     hass.data[DOMAIN].pop(entry.data["name"])
     return True
 
@@ -130,7 +109,6 @@ class IngeteamModbusHub:
 
     @callback
     def async_add_ingeteam_sensor(self, update_callback):
-        """Listen for data updates."""
         if not self._sensors:
             self.connect()
             self._unsub_interval_method = async_track_time_interval(
@@ -140,7 +118,6 @@ class IngeteamModbusHub:
 
     @callback
     def async_remove_ingeteam_sensor(self, update_callback):
-        """Remove data update."""
         self._sensors.remove(update_callback)
         if not self._sensors and self._unsub_interval_method:
             self._unsub_interval_method()
@@ -148,18 +125,14 @@ class IngeteamModbusHub:
             self.close()
 
     async def async_refresh_modbus_data(self, _now: Optional[int] = None) -> None:
-        """Time to update."""
-        if not self._sensors:
-            return
+        if not self._sensors: return
         update_result = await self._hass.async_add_executor_job(self._update_modbus_data)
         if update_result:
             for update_callback in self._sensors:
                 update_callback()
 
     def _update_modbus_data(self) -> bool:
-        """Synchronously fetch data from the modbus device. To be run in an executor."""
-        if not self._check_and_reconnect():
-            return False
+        if not self._check_and_reconnect(): return False
         try:
             return self.read_modbus_data()
         except ModbusException as e:
@@ -170,17 +143,11 @@ class IngeteamModbusHub:
             return False
 
     @property
-    def name(self):
-        """Return the name of this hub."""
-        return self._name
-
+    def name(self): return self._name
     def close(self):
-        """Disconnect client."""
-        with self._lock:
-            self._client.close()
+        with self._lock: self._client.close()
 
     def _check_and_reconnect(self) -> bool:
-        """Check connection and reconnect if needed."""
         with self._lock:
             if not self._client.is_socket_open():
                 _LOGGER.info("Modbus client is not connected, trying to reconnect")
@@ -188,36 +155,39 @@ class IngeteamModbusHub:
             return True
 
     def connect(self) -> bool:
-        """Connect client."""
         with self._lock:
             result = self._client.connect()
-            if result:
-                _LOGGER.info("Successfully connected to %s:%s", self._host, self._port)
-            else:
-                _LOGGER.warning("Could not connect to %s:%s", self._host, self._port)
-            return result
+        if result: _LOGGER.info("Successfully connected to %s:%s", self._host, self._port)
+        else: _LOGGER.warning("Could not connect to %s:%s", self._host, self._port)
+        return result
 
     def read_input_registers(self, unit, address, count):
-        """Read input registers."""
         with self._lock:
             return self._client.read_input_registers(address=address, count=count, slave=unit)
 
     @staticmethod
     def _decode_signed(value: int) -> int:
-        """Decode a 16-bit signed integer (two's complement)."""
-        if value & 0x8000:
-            return value - 0x10000
+        if value & 0x8000: return value - 0x10000
         return value
 
     @staticmethod
     def _u32_from_words(registers, start_index: int) -> int:
-        """
-        Combina dos registros de 16 bits en un uint32 con orden de palabras BIG.
-        El registro en start_index es la palabra ALTA (high word).
-        """
+        """Combina dos registros de 16 bits en un uint32 con orden de palabras BIG."""
         high = registers[start_index]
         low = registers[start_index + 1]
         return (high << 16) | low
+
+    @staticmethod
+    def _decode_bitmask(value: int, mask_map: dict[int, str]) -> str:
+        """Decodifica un valor entero en una cadena de texto basada en un mapa de bitmask."""
+        if value == 0:
+            return "None"
+        
+        active_flags = [
+            text for bit_value, text in mask_map.items() if value & bit_value
+        ]
+        
+        return ", ".join(active_flags) if active_flags else f"Unknown ({value})"
 
     def read_modbus_data(self) -> bool:
         """Read and decode all registers in a single, optimized function."""
@@ -254,11 +224,11 @@ class IngeteamModbusHub:
         batt_status_code = registers[26]
         self.data["battery_status"] = BATTERY_STATUS.get(batt_status_code, f"Unknown ({batt_status_code})")
         self.data["battery_temp"] = self._decode_signed(registers[27]) / 10.0
-        self.data["battery_bms_alarm"] = registers[28]
+        self.data["battery_bms_alarm"] = self._decode_bitmask(registers[28], BATTERY_BMS_ALARMS)
         batt_limit_code = registers[29]
         self.data["battery_discharge_limitation_reason"] = BATTERY_LIMITATION_REASONS.get(batt_limit_code, f"Unknown ({batt_limit_code})")
         self.data["battery_voltage_internal"] = registers[30] / 10.0
-        self.data["battery_bms_flags"] = registers[68]
+        self.data["battery_bms_flags"] = self._decode_bitmask(registers[68], BATTERY_BMS_FLAGS)
         self.data["battery_bms_warnings"] = registers[73]
         self.data["battery_bms_errors"] = registers[74]
         self.data["battery_bms_faults"] = registers[75]
