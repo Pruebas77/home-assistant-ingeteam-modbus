@@ -202,9 +202,6 @@ class IngeteamModbusHub:
         with self._lock:
             return self._client.read_input_registers(address=address, count=count, slave=unit)
 
-    # -------------------------
-    # Utilidades de decodificación
-    # -------------------------
     @staticmethod
     def _decode_signed(value: int) -> int:
         """Decode a 16-bit signed integer (two's complement)."""
@@ -213,20 +210,15 @@ class IngeteamModbusHub:
         return value
 
     @staticmethod
-    def _u32_from_words_le(registers, start_index: int) -> int:
+    def _u32_from_words(registers, start_index: int) -> int:
         """
-        Combina dos registros de 16 bits en un uint32.
-        Orden de palabras 'little' (wordorder LITTLE): low word primero.
-        Cada palabra mantiene su endianness de bytes (como en BIG del decoder original),
-        por lo que basta con desplazar 16 bits la palabra alta.
+        Combina dos registros de 16 bits en un uint32 con orden de palabras BIG.
+        El registro en start_index es la palabra ALTA (high word).
         """
-        low = registers[start_index]
-        high = registers[start_index + 1]
+        high = registers[start_index]
+        low = registers[start_index + 1]
         return (high << 16) | low
 
-    # -------------------------
-    # Lectura y parseo principal
-    # -------------------------
     def read_modbus_data(self) -> bool:
         """Read and decode all registers in a single, optimized function."""
         all_regs_response = self.read_input_registers(unit=self._address, address=0, count=81)
@@ -236,23 +228,16 @@ class IngeteamModbusHub:
 
         registers = all_regs_response.registers
         if len(registers) < 81:
-            _LOGGER.warning(
-                "Incomplete Modbus response, expected 81 registers but got %s", len(registers)
-            )
+            _LOGGER.warning("Incomplete Modbus response, expected 81 registers but got %s", len(registers))
             return False
 
         # --- Inverter Status & Lifetime ---
-        # Antes usabas BinaryPayloadDecoder con byteorder=BIG, wordorder=LITTLE (dos registros: 30007-30008)
-        self.data["total_operation_time"] = self._u32_from_words_le(registers, 6)  # Reg 30007-8
-
-        self.data["stop_code"] = registers[9]  # Reg 30010
-
-        # Alarm code (30011-30012) → mismo esquema de 32 bits
-        self.data["alarm_code"] = self._u32_from_words_le(registers, 10)  # Reg 30011-12
-
-        status_code = registers[15]  # Reg 30016
+        self.data["total_operation_time"] = self._u32_from_words(registers, 6)
+        self.data["stop_code"] = registers[9]
+        self.data["alarm_code"] = self._u32_from_words(registers, 10)
+        status_code = registers[15]
         self.data["status"] = INVERTER_STATUS.get(status_code, f"Unknown ({status_code})")
-        self.data["waiting_time"] = registers[16]  # Reg 30017
+        self.data["waiting_time"] = registers[16]
 
         # --- Battery Data ---
         self.data["battery_voltage"] = registers[17] / 10.0
@@ -271,15 +256,13 @@ class IngeteamModbusHub:
         self.data["battery_temp"] = self._decode_signed(registers[27]) / 10.0
         self.data["battery_bms_alarm"] = registers[28]
         batt_limit_code = registers[29]
-        self.data["battery_discharge_limitation_reason"] = BATTERY_LIMITATION_REASONS.get(
-            batt_limit_code, f"Unknown ({batt_limit_code})"
-        )
+        self.data["battery_discharge_limitation_reason"] = BATTERY_LIMITATION_REASONS.get(batt_limit_code, f"Unknown ({batt_limit_code})")
         self.data["battery_voltage_internal"] = registers[30] / 10.0
-        self.data["battery_bms_flags"] = registers[68]  # Reg 30069
-        self.data["battery_bms_warnings"] = registers[73]  # Reg 30074
-        self.data["battery_bms_errors"] = registers[74]  # Reg 30075
-        self.data["battery_bms_faults"] = registers[75]  # Reg 30076
-        self.data["battery_charge_limitation_reason"] = registers[77]  # Reg 30078
+        self.data["battery_bms_flags"] = registers[68]
+        self.data["battery_bms_warnings"] = registers[73]
+        self.data["battery_bms_errors"] = registers[74]
+        self.data["battery_bms_faults"] = registers[75]
+        self.data["battery_charge_limitation_reason"] = registers[77]
 
         # --- PV Data ---
         self.data["pv1_voltage"] = registers[31]
@@ -308,8 +291,8 @@ class IngeteamModbusHub:
         self.data["cl_reactive_power"] = self._decode_signed(registers[47])
         self.data["total_loads_power"] = registers[78]
         self.data["dc_bus_voltage"] = registers[54]
-        self.data["positive_isolation_resistance"] = registers[59]  # Reg 30060
-        self.data["negative_isolation_resistance"] = registers[60]  # Reg 30061
+        self.data["positive_isolation_resistance"] = registers[59]
+        self.data["negative_isolation_resistance"] = registers[60]
         self.data["temp_mod_1"] = self._decode_signed(registers[55]) / 10.0
         self.data["temp_mod_2"] = self._decode_signed(registers[56]) / 10.0
         self.data["temp_pcb"] = self._decode_signed(registers[57]) / 10.0
