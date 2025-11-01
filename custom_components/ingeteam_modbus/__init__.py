@@ -115,6 +115,8 @@ class IngeteamModbusHub:
     def __init__(self, hass, name, host, port, address, scan_interval, read_meter=True, read_battery=False):
         """Initialize the Modbus hub."""
         self._hass = hass
+        # Nota: no fijamos versiones. Construimos el cliente estándar.
+        # En pymodbus 3.x las firmas han cambiado, por eso la lectura es robusta abajo.
         self._client = ModbusTcpClient(host=host, port=port, timeout=max(3, (scan_interval - 1)))
         self._lock = threading.Lock()
         self._name = name
@@ -177,30 +179,134 @@ class IngeteamModbusHub:
     def close(self):
         """Disconnect client."""
         with self._lock:
-            self._client.close()
+            try:
+                self._client.close()
+            except Exception:
+                _LOGGER.debug("Error closing Modbus client", exc_info=True)
 
     def _check_and_reconnect(self) -> bool:
         """Check connection and reconnect if needed."""
         with self._lock:
-            if not self._client.is_socket_open():
-                _LOGGER.info("Modbus client is not connected, trying to reconnect")
+            try:
+                # Algunos clientes exponen is_socket_open, otros no
+                is_open = getattr(self._client, "is_socket_open", None)
+                if callable(is_open):
+                    open_ok = is_open()
+                else:
+                    # fallback: intentamos una conexión liviana si no hay método
+                    open_ok = False
+                if not open_ok:
+                    _LOGGER.info("Modbus client is not connected, trying to reconnect")
+                    return self._client.connect()
+                return True
+            except Exception:
+                _LOGGER.debug("Error comprobando conexión Modbus, intentando reconectar", exc_info=True)
                 return self._client.connect()
-            return True
 
     def connect(self) -> bool:
         """Connect client."""
         with self._lock:
-            result = self._client.connect()
-            if result:
-                _LOGGER.info("Successfully connected to %s:%s", self._host, self._port)
-            else:
-                _LOGGER.warning("Could not connect to %s:%s", self._host, self._port)
-            return result
+            try:
+                result = self._client.connect()
+                if result:
+                    _LOGGER.info("Successfully connected to %s:%s", self._host, self._port)
+                else:
+                    _LOGGER.warning("Could not connect to %s:%s", self._host, self._port)
+                return result
+            except Exception:
+                _LOGGER.exception("Exception connecting to %s:%s", self._host, self._port)
+                return False
 
     def read_input_registers(self, unit, address, count):
-        """Read input registers."""
+        """Read input registers.
+
+        Esta función intenta múltiples variantes para ser compatible con distintas versiones
+        de pymodbus (device_id / unit / slave / unit_id / slaveaddress) y, si es necesario,
+        construye un request explícito usando ReadInputRegistersRequest desde posibles rutas.
+        """
         with self._lock:
-            return self._client.read_input_registers(address=address, count=count, device_id=unit)
+            # 1) Intentar variantes directas (compatibilidad máxima)
+            try:
+                return self._client.read_input_registers(address=address, count=count, device_id=unit)
+            except TypeError:
+                pass
+            except Exception as e:
+                _LOGGER.debug("read_input_registers(device_id=..) fallo: %s", e, exc_info=True)
+
+            try:
+                return self._client.read_input_registers(address=address, count=count, unit=unit)
+            except TypeError:
+                pass
+            except Exception as e:
+                _LOGGER.debug("read_input_registers(unit=..) fallo: %s", e, exc_info=True)
+
+            try:
+                return self._client.read_input_registers(address=address, count=count, slave=unit)
+            except TypeError:
+                pass
+            except Exception as e:
+                _LOGGER.debug("read_input_registers(slave=..) fallo: %s", e, exc_info=True)
+
+            try:
+                return self._client.read_input_registers(address=address, count=count, unit_id=unit)
+            except TypeError:
+                pass
+            except Exception as e:
+                _LOGGER.debug("read_input_registers(unit_id=..) fallo: %s", e, exc_info=True)
+
+            try:
+                return self._client.read_input_registers(address=address, count=count, slaveaddress=unit)
+            except TypeError:
+                pass
+            except Exception as e:
+                _LOGGER.debug("read_input_registers(slaveaddress=..) fallo: %s", e, exc_info=True)
+
+            # 2) Intentar uso de Request object (varias rutas de import posibles)
+            ReadInputReq = None
+            import_errors = []
+            try:
+                # ruta posible: pymodbus.register_read_message.ReadInputRegistersRequest
+                from pymodbus.register_read_message import ReadInputRegistersRequest as _RIR
+                ReadInputReq = _RIR
+            except Exception as e:
+                import_errors.append(("pymodbus.register_read_message", e))
+                try:
+                    # ruta posible: pymodbus.pdu.register_message.ReadInputRegistersRequest
+                    from pymodbus.pdu.register_message import ReadInputRegistersRequest as _RIR2
+                    ReadInputReq = _RIR2
+                except Exception as e2:
+                    import_errors.append(("pymodbus.pdu.register_message", e2))
+                    try:
+                        # ruta alternativa: pymodbus.pdu.ReadInputRegistersRequest (poco común)
+                        from pymodbus.pdu import ReadInputRegistersRequest as _RIR3
+                        ReadInputReq = _RIR3
+                    except Exception as e3:
+                        import_errors.append(("pymodbus.pdu", e3))
+                        ReadInputReq = None
+
+            if ReadInputReq is not None:
+                try:
+                    # Construimos request pasando 'slave' (id del equipo) si la clase lo acepta.
+                    req = ReadInputReq(address=address, count=count, slave=unit)
+                    # ejecutar la petición
+                    return self._client.execute(req)
+                except TypeError:
+                    # Si la clase no acepta 'slave' probamos sin él
+                    try:
+                        req = ReadInputReq(address=address, count=count)
+                        return self._client.execute(req)
+                    except Exception as e:
+                        _LOGGER.debug("Execute ReadInputRegistersRequest sin slave falló: %s", e, exc_info=True)
+                except Exception as e:
+                    _LOGGER.debug("Error ejecutando ReadInputRegistersRequest: %s", e, exc_info=True)
+
+            # 3) Si todo falla, mostrar import_errors para depuración y devolver None
+            _LOGGER.error(
+                "No se pudo invocar read_input_registers con ninguna firma conocida. "
+                "Errores de importación: %s",
+                "; ".join(f"{p}:{err}" for p, err in import_errors),
+            )
+            return None
 
     # -------------------------
     # Utilidades de decodificación
@@ -230,8 +336,21 @@ class IngeteamModbusHub:
     def read_modbus_data(self) -> bool:
         """Read and decode all registers in a single, optimized function."""
         all_regs_response = self.read_input_registers(unit=self._address, address=0, count=81)
-        if all_regs_response.isError():
-            _LOGGER.error("Error reading modbus registers: %s", all_regs_response)
+        if all_regs_response is None:
+            _LOGGER.error("No se obtuvo respuesta de read_input_registers (None).")
+            return False
+
+        # Algunos responses devuelven errores con método isError()
+        try:
+            if hasattr(all_regs_response, "isError") and all_regs_response.isError():
+                _LOGGER.error("Error reading modbus registers: %s", all_regs_response)
+                return False
+        except Exception:
+            _LOGGER.debug("No se pudo comprobar isError() en la respuesta", exc_info=True)
+
+        # extraer registros si existen
+        if not hasattr(all_regs_response, "registers"):
+            _LOGGER.error("Respuesta Modbus sin atributo 'registers': %s", all_regs_response)
             return False
 
         registers = all_regs_response.registers
