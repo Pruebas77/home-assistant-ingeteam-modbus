@@ -198,9 +198,18 @@ class IngeteamModbusHub:
             return result
 
     def read_input_registers(self, unit, address, count):
-        """Read input registers."""
+    """Read input registers."""
         with self._lock:
-            return self._client.read_input_registers(address=address, count=count, device_id=unit)
+            try:
+                # pymodbus >= 3.6 (usa device_id)
+                return self._client.read_input_registers(address=address, count=count, device_id=unit)
+            except TypeError:
+                try:
+                    # pymodbus 3.0 - 3.5 (usa unit)
+                    return self._client.read_input_registers(address=address, count=count, unit=unit)
+                except TypeError:
+                    # pymodbus <= 2.5 (usa slave)
+                    return self._client.read_input_registers(address=address, count=count, slave=unit)
 
     # -------------------------
     # Utilidades de decodificación
